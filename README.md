@@ -28,18 +28,19 @@ The MCP server logs into WhatsApp as a linked companion device (via [whatsmeow](
 These are Claude Code commands — run `claude` to start a session first.
 
 ```
-/plugin install whatsapp@<source>
+/plugin marketplace add janfabian/claude-whatsapp
+/plugin install whatsapp@claude-whatsapp
 /reload-plugins
 ```
 
-The first launch compiles the bridge binary (uses Go). Subsequent launches reuse it.
+The first launch runs `bun install` and compiles the bridge binary (requires Go). Subsequent launches reuse it.
 
 **2. Relaunch with the channel flag.**
 
 The server won't ingest messages without this — exit your session and start a new one:
 
 ```sh
-claude --channels plugin:whatsapp@<source>
+claude --channels plugin:whatsapp@claude-whatsapp
 ```
 
 **3. Scan the QR.**
