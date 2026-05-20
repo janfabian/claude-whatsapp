@@ -25,6 +25,8 @@ import (
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -1073,6 +1075,15 @@ func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
+
+	// Identify ourselves to WhatsApp as "Claude Code" with a desktop icon.
+	// This is what appears in Linked Devices on the phone instead of the
+	// default "whatsmeow". Configurable via env so users can override.
+	// NOTE: only affects new pairings — already-linked devices keep their
+	// previous name until they're unlinked and re-paired.
+	osName := envOr("WHATSAPP_DEVICE_NAME", "Claude Code")
+	store.SetOSInfo(osName, [3]uint32{2, 0, 0})
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)

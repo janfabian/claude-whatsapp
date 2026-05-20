@@ -126,6 +126,20 @@ WhatsApp's Web API exposes neither. Long-running tasks should send a *new* messa
 
 To run multiple bridges on one machine (different accounts), point `WHATSAPP_STATE_DIR` at a different directory and use a different `WHATSAPP_BRIDGE_PORT` per instance.
 
+## Linked-device name
+
+By default the bridge identifies itself to WhatsApp as **"Claude Code"** with a desktop icon — that's what appears on your phone in Settings → Linked Devices. Override via env:
+
+```sh
+WHATSAPP_DEVICE_NAME="My Assistant" claude --channels plugin:whatsapp@claude-whatsapp
+```
+
+The name is only sent at pairing time. If you're already linked (and seeing the old `whatsmeow` label, or want to change to a new label), you need to re-pair:
+
+1. On your phone: WhatsApp → Settings → Linked Devices → tap the entry → Log Out
+2. On disk: `rm ~/.claude/channels/whatsapp/store/whatsapp.db`
+3. Relaunch the channel session and `/whatsapp:login` again. `messages.db` (your search history) survives.
+
 ## Troubleshooting
 
 - **MCP server didn't start at all.** Most often `bun` isn't in the PATH of the shell that launched `claude`. Verify with `which bun` from the same shell; ensure `~/.bun/bin` is in your shell rc. Same applies to `go` for the bridge build step.
