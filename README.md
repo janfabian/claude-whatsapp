@@ -55,8 +55,21 @@ The bridge writes the pairing string to `~/.claude/channels/whatsapp/qr.txt` *an
   Scan with WhatsApp → Settings → Linked Devices → Link a Device.
 
 > ⚠️ The raw string in `qr.txt` looks like `2@xVTVC…,Ql31…,I+fX…,0Q4A…,9` — that's pairing data, **not a URL**. Some assistants hallucinate a `https://wa.me/settings/linked_devices#…` prefix; ignore it. The string is only meaningful when encoded as a QR image.
+>
+> ⚠️ **QRs rotate every ~30 seconds.** Scan immediately. If the link fails, the QR is most likely already stale — `/whatsapp:login` checks `qr.txt`'s mtime and the bridge's health endpoint before rendering, so re-run it to force a fresh check. A stale QR silently fails on the phone with no error message.
 
 Once accepted, `qr.txt` disappears and the bridge is paired. Session lasts ~20 days.
+
+### Verifying the bridge is actually alive
+
+The plugin's MCP server spawns the Go bridge as a child process. If the spawn failed (bun/go not in PATH, port conflict, etc.) `/whatsapp:login` will show a QR that nothing is listening to — and WhatsApp can't link to a dead bridge. Quick sanity check from any terminal:
+
+```sh
+pgrep -af whatsapp-bridge                                # should print the pid + command
+curl -s http://127.0.0.1:8080/api/health                 # should print {"connected":true,"logged_in":<bool>}
+```
+
+If either is empty/fails, the bridge isn't running. Restart your Claude Code session with `--channels plugin:whatsapp@claude-whatsapp` and check `claude --debug` for spawn errors.
 
 **4. Pair a sender.**
 
@@ -129,6 +142,8 @@ To run multiple bridges on one machine (different accounts), point `WHATSAPP_STA
 - **Stuck after re-launch.** A previous bridge may still hold the WhatsApp socket. The MCP server kills stale poller PIDs on startup, but if the process tree got severed (SIGKILL, terminal closed mid-session), look for an orphan `whatsapp-bridge` process and kill it manually.
 - **Session expired / re-auth needed.** Delete `~/.claude/channels/whatsapp/store/whatsapp.db` and `/whatsapp:login` again. `messages.db` (your search history) survives.
 - **`/whatsapp:login` says "no QR pending".** Either the bridge isn't running (check `bridge.log`), or it's already paired. `ls ~/.claude/channels/whatsapp/store/whatsapp.db` — if it exists with non-zero size, you're already paired.
+- **Scanned the QR but my phone won't link.** Almost always a stale QR — WhatsApp's pairing code rotates every ~30s. If you saw the QR more than 25 seconds before scanning, it's expired. Less commonly: the bridge wasn't actually running when you scanned (verify with `pgrep -af whatsapp-bridge`), or you've hit WhatsApp's 4-linked-device limit (remove one from Settings → Linked Devices on the phone).
+- **Suspicious / stale state from a previous run.** If something feels off, nuke `~/.claude/channels/whatsapp/` entirely and restart. `messages.db` (your local history) is the only thing you'd want to keep — back it up first if you've got hours of conversation indexed.
 
 ## Plugin install location
 
