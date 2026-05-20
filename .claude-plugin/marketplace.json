@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "whatsapp",
-      "source": ".",
+      "source": "./",
       "description": "Channel-mode MCP plugin that bridges WhatsApp DMs and groups to a Claude Code session. Mirrors the architecture of the official Telegram plugin.",
       "category": "messaging",
       "homepage": "https://github.com/janfabian/claude-whatsapp",
