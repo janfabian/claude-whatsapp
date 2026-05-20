@@ -1,0 +1,19 @@
+{
+  "name": "claude-channel-whatsapp",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": "./server.ts",
+  "scripts": {
+    "start": "bun install --no-summary && bash scripts/build-bridge.sh && bun server.ts",
+    "build-bridge": "bash scripts/build-bridge.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.12"
+  }
+}

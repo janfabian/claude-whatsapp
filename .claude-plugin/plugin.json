@@ -1,0 +1,11 @@
+{
+  "name": "whatsapp",
+  "description": "WhatsApp channel for Claude Code — chat with your assistant over WhatsApp. Bridges via whatsmeow (unofficial WhatsApp Web client). Manage pairing, allowlists, and policy via /whatsapp:access.",
+  "version": "0.0.1",
+  "keywords": [
+    "whatsapp",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
