@@ -16,9 +16,9 @@ The MCP server logs into WhatsApp as a linked companion device (via [whatsmeow](
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`.
-- [Go](https://go.dev/dl/) — to build the whatsmeow bridge binary. Only needed at install time; the binary is cached in `bridge/bin/`.
-- (optional) [`qrencode`](https://fukuchi.org/works/qrencode/) — for in-terminal QR rendering by `/whatsapp:login` (`apt install qrencode` / `brew install qrencode`). Without it, you can still scan from the bridge's stdout log.
+- [Bun](https://bun.sh) — the MCP server runs on Bun. Install with `curl -fsSL https://bun.sh/install | bash`. **Make sure `~/.bun/bin` is in the PATH of the shell that launches `claude`**, otherwise the MCP server spawn fails silently.
+- [Go](https://go.dev/dl/) 1.23+ — to build the whatsmeow bridge binary. Only needed at install time; the binary is cached in `bridge/bin/`. Needs CGO (Linux/macOS work out of the box; Windows needs a C toolchain like MSYS2).
+- (optional) [`qrencode`](https://fukuchi.org/works/qrencode/) — for in-terminal QR rendering by `/whatsapp:login` (`apt install qrencode` / `brew install qrencode`). Without it, the bridge's `bridge.log` already contains an ASCII QR you can scan — see step 3 below.
 - A spare phone with WhatsApp installed for the linked-device QR scan.
 
 ## Quick setup
@@ -45,13 +45,18 @@ claude --channels plugin:whatsapp@claude-whatsapp
 
 **3. Scan the QR.**
 
-The bridge writes a QR pairing string to `~/.claude/channels/whatsapp/qr.txt` on first run. From your Claude Code session:
+The bridge writes the pairing string to `~/.claude/channels/whatsapp/qr.txt` *and* renders the QR as ASCII half-block art to its stdout. Two ways to actually see something scannable:
 
-```
-/whatsapp:login
-```
+- **With `qrencode` installed:** from your Claude Code session, `/whatsapp:login` renders an inline UTF-8 QR.
+- **Without `qrencode`:** the bridge already drew the QR in its log. Open a terminal large enough to fit a 33×33 block grid (~70 columns wide), then:
+  ```sh
+  tail -n 50 ~/.claude/channels/whatsapp/bridge.log
+  ```
+  Scan with WhatsApp → Settings → Linked Devices → Link a Device.
 
-Scan the QR with WhatsApp → Settings → Linked Devices → Link a Device. Once accepted, the file disappears and the bridge is paired.
+> ⚠️ The raw string in `qr.txt` looks like `2@xVTVC…,Ql31…,I+fX…,0Q4A…,9` — that's pairing data, **not a URL**. Some assistants hallucinate a `https://wa.me/settings/linked_devices#…` prefix; ignore it. The string is only meaningful when encoded as a QR image.
+
+Once accepted, `qr.txt` disappears and the bridge is paired. Session lasts ~20 days.
 
 **4. Pair a sender.**
 
@@ -110,8 +115,27 @@ To run multiple bridges on one machine (different accounts), point `WHATSAPP_STA
 
 ## Troubleshooting
 
-- **No QR appears.** Check `bridge.log`. If the bridge can't start, the binary may be missing — run `bash scripts/build-bridge.sh` (requires Go).
+- **MCP server didn't start at all.** Most often `bun` isn't in the PATH of the shell that launched `claude`. Verify with `which bun` from the same shell; ensure `~/.bun/bin` is in your shell rc. Same applies to `go` for the bridge build step.
+- **No QR appears.** Check `bridge.log`. If the bridge can't start, the binary may be missing — run `bash scripts/build-bridge.sh` from the plugin install dir (see "Plugin install location" below).
+- **`bridge.log` shows `client outdated (405)`.** WhatsApp periodically invalidates older whatsmeow clients. Bump and rebuild:
+  ```sh
+  cd <plugin-install-dir>/bridge
+  go get -u go.mau.fi/whatsmeow@latest && go mod tidy
+  bash ../scripts/build-bridge.sh
+  ```
+  Then restart Claude Code. This is *different from* the ~20-day session re-auth.
 - **"chat is not allowlisted" when Claude tries to reply.** Outbound tools enforce the same allowlist as inbound. Add the JID via `/whatsapp:access allow <jid>` or `group add <jid>`.
 - **Sender DMs and gets nothing back.** Check `dmPolicy`. If it's `allowlist`, unknown senders are dropped silently. Flip to `pairing` briefly to capture their JID.
-- **Stuck after re-launch.** A previous bridge may still hold the WhatsApp socket. Look for stale processes with the PID files in the state dir.
-- **Re-auth needed.** Delete `~/.claude/channels/whatsapp/store/whatsapp.db` and `/whatsapp:login` again. `messages.db` (your search history) survives.
+- **Stuck after re-launch.** A previous bridge may still hold the WhatsApp socket. The MCP server kills stale poller PIDs on startup, but if the process tree got severed (SIGKILL, terminal closed mid-session), look for an orphan `whatsapp-bridge` process and kill it manually.
+- **Session expired / re-auth needed.** Delete `~/.claude/channels/whatsapp/store/whatsapp.db` and `/whatsapp:login` again. `messages.db` (your search history) survives.
+- **`/whatsapp:login` says "no QR pending".** Either the bridge isn't running (check `bridge.log`), or it's already paired. `ls ~/.claude/channels/whatsapp/store/whatsapp.db` — if it exists with non-zero size, you're already paired.
+
+## Plugin install location
+
+When installed via `/plugin install whatsapp@claude-whatsapp`, the plugin source lives at:
+
+```
+~/.claude/plugins/cache/claude-whatsapp/whatsapp/<version>/
+```
+
+That's where `bridge/bin/` is created, where you'd run `git pull` to update manually, and where the build script needs to be run from if the auto-build fails. Use `claude --debug` to see the actual spawn command and capture stderr from the MCP server.
