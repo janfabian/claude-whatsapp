@@ -72,6 +72,97 @@ const BRIDGE_ADDR = process.env.WHATSAPP_BRIDGE_ADDR || '127.0.0.1'
 const BRIDGE_BASE = `http://${BRIDGE_ADDR}:${BRIDGE_PORT}`
 
 // ---------------------------------------------------------------------------
+// Per-session inbound filter
+// ---------------------------------------------------------------------------
+// WHATSAPP_SESSION_FILTER (JSON) declared at launch scopes which inbound
+// messages this Claude session receives. The bridge does chat-routing
+// (chats / excludeChats / exclusive). mentionPatterns is enforced locally
+// in gate() and overrides access.json's global mentionPatterns when set.
+// No env var → match everything (back-compat).
+
+type SessionFilter = {
+  chats?: string[]
+  excludeChats?: string[]
+  mentionPatterns?: string[]
+  exclusive?: boolean
+}
+
+const JID_RE = /^[0-9A-Za-z._-]+@(s\.whatsapp\.net|g\.us|broadcast|newsletter|lid)$/
+
+function parseSessionFilter(): SessionFilter | undefined {
+  const raw = process.env.WHATSAPP_SESSION_FILTER
+  if (!raw || raw.trim() === '') return undefined
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch (err) {
+    process.stderr.write(`whatsapp channel: WHATSAPP_SESSION_FILTER is not valid JSON: ${err}\n`)
+    process.exit(1)
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    process.stderr.write('whatsapp channel: WHATSAPP_SESSION_FILTER must be a JSON object\n')
+    process.exit(1)
+  }
+  const p = parsed as Record<string, unknown>
+  const out: SessionFilter = {}
+  const jidArray = (v: unknown, field: string): string[] | undefined => {
+    if (v === undefined) return undefined
+    if (!Array.isArray(v) || v.some(x => typeof x !== 'string')) {
+      process.stderr.write(`whatsapp channel: WHATSAPP_SESSION_FILTER.${field} must be string[]\n`)
+      process.exit(1)
+    }
+    for (const j of v as string[]) {
+      if (!JID_RE.test(j)) {
+        process.stderr.write(`whatsapp channel: WHATSAPP_SESSION_FILTER.${field} contains invalid JID: ${j}\n`)
+        process.exit(1)
+      }
+    }
+    return v as string[]
+  }
+  out.chats = jidArray(p.chats, 'chats')
+  out.excludeChats = jidArray(p.excludeChats, 'excludeChats')
+  if (p.mentionPatterns !== undefined) {
+    if (!Array.isArray(p.mentionPatterns) || p.mentionPatterns.some(x => typeof x !== 'string')) {
+      process.stderr.write('whatsapp channel: WHATSAPP_SESSION_FILTER.mentionPatterns must be string[]\n')
+      process.exit(1)
+    }
+    for (const pat of p.mentionPatterns as string[]) {
+      try { new RegExp(pat, 'i') } catch (err) {
+        process.stderr.write(`whatsapp channel: WHATSAPP_SESSION_FILTER.mentionPatterns regex invalid: ${pat} (${err})\n`)
+        process.exit(1)
+      }
+    }
+    out.mentionPatterns = p.mentionPatterns as string[]
+  }
+  if (p.exclusive !== undefined) {
+    if (typeof p.exclusive !== 'boolean') {
+      process.stderr.write('whatsapp channel: WHATSAPP_SESSION_FILTER.exclusive must be boolean\n')
+      process.exit(1)
+    }
+    out.exclusive = p.exclusive
+    if (out.exclusive && (!out.chats || out.chats.length === 0)) {
+      process.stderr.write('whatsapp channel: WHATSAPP_SESSION_FILTER.exclusive=true requires a non-empty chats allowlist\n')
+      process.exit(1)
+    }
+  }
+  return out
+}
+
+const SESSION_FILTER: SessionFilter | undefined = parseSessionFilter()
+
+// Persistent client_id survives MCP restarts so exclusive claims can be
+// re-honored within the bridge's grace window after a brief disconnect.
+const SESSION_ID_FILE = join(STATE_DIR, 'session.id')
+function loadOrCreateClientId(): string {
+  try {
+    const v = readFileSync(SESSION_ID_FILE, 'utf8').trim()
+    if (v) return v
+  } catch {}
+  const v = (globalThis.crypto as Crypto).randomUUID()
+  try { writeFileSync(SESSION_ID_FILE, v, { mode: 0o600 }) } catch {}
+  return v
+}
+const CLIENT_ID = loadOrCreateClientId()
+
+// ---------------------------------------------------------------------------
 // Process bookkeeping
 // ---------------------------------------------------------------------------
 
@@ -85,7 +176,6 @@ function takeOverPidFile(file: string): void {
   } catch {}
 }
 takeOverPidFile(MCP_PID_FILE)
-takeOverPidFile(BRIDGE_PID_FILE)
 writeFileSync(MCP_PID_FILE, String(process.pid))
 
 process.on('unhandledRejection', err => {
@@ -255,6 +345,22 @@ function spawnBridge(): void {
     try { rmSync(BRIDGE_PID_FILE) } catch {}
     bridgeChild = null
   })
+}
+
+// ensureBridge checks for a live bridge before spawning. If /api/health
+// responds, this MCP server attaches as a sibling WS client — it does NOT
+// take over the PID file or spawn a duplicate. This is what makes multiple
+// MCP-connected Claude sessions sharing one bridge actually work.
+async function ensureBridge(): Promise<void> {
+  try {
+    const r = await fetch(`${BRIDGE_BASE}/api/health`, { signal: AbortSignal.timeout(1000) })
+    if (r.ok) {
+      process.stderr.write('whatsapp channel: attaching to existing bridge\n')
+      return
+    }
+  } catch {}
+  takeOverPidFile(BRIDGE_PID_FILE)
+  spawnBridge()
 }
 
 async function waitForBridgeReady(timeoutMs = 20_000): Promise<{ logged_in: boolean }> {
@@ -631,7 +737,10 @@ function gate(evt: InboundEvent): GateResult {
   if (!policy) return { action: 'drop' }
   const allow = policy.allowFrom ?? []
   if (allow.length > 0 && !allow.includes(senderId)) return { action: 'drop' }
-  if (policy.requireMention && !isMentioned(evt.content, access.mentionPatterns)) return { action: 'drop' }
+  // Session filter's mentionPatterns, when set, fully overrides access.json's
+  // global mentionPatterns for this session. When absent, fall through to global.
+  const mention = SESSION_FILTER?.mentionPatterns ?? access.mentionPatterns
+  if (policy.requireMention && !isMentioned(evt.content, mention)) return { action: 'drop' }
   return { action: 'deliver', access }
 }
 
@@ -749,20 +858,57 @@ function safeName(s: string): string { return s.replace(/[<>\[\]\r\n;]/g, '_') }
 
 let ws: WebSocket | null = null
 let shuttingDown = false
+let subscribed = false
+
+function bridgeSubscribeFrame(): string {
+  const filter = SESSION_FILTER === undefined
+    ? null
+    : {
+        chats: SESSION_FILTER.chats ?? [],
+        excludeChats: SESSION_FILTER.excludeChats ?? [],
+        exclusive: SESSION_FILTER.exclusive ?? false,
+      }
+  return JSON.stringify({ type: 'subscribe', client_id: CLIENT_ID, filter })
+}
 
 function connectWS(): void {
   if (shuttingDown) return
   const url = `ws://${BRIDGE_ADDR}:${BRIDGE_PORT}/ws/events`
   ws = new WebSocket(url)
-  ws.on('open', () => process.stderr.write(`whatsapp channel: ws connected to ${url}\n`))
-  ws.on('message', raw => {
-    try {
-      const evt = JSON.parse(String(raw)) as InboundEvent
-      if (evt.type === 'message') void handleInbound(evt)
-    } catch (err) {
-      process.stderr.write(`whatsapp channel: bad ws frame: ${err}\n`)
-    }
+  subscribed = false
+
+  ws.on('open', () => {
+    process.stderr.write(`whatsapp channel: ws connected to ${url}\n`)
+    try { ws!.send(bridgeSubscribeFrame()) }
+    catch (err) { process.stderr.write(`whatsapp channel: subscribe send failed: ${err}\n`) }
   })
+
+  ws.on('message', raw => {
+    let parsed: { type?: string; ok?: boolean; error?: string; session_id?: string } & InboundEvent
+    try { parsed = JSON.parse(String(raw)) }
+    catch (err) {
+      process.stderr.write(`whatsapp channel: bad ws frame: ${err}\n`)
+      return
+    }
+    if (!subscribed) {
+      if (parsed.type === 'subscribe_ack') {
+        if (parsed.ok) {
+          subscribed = true
+          process.stderr.write(`whatsapp channel: subscribed (session_id=${parsed.session_id})\n`)
+        } else {
+          process.stderr.write(`whatsapp channel: subscribe rejected: ${parsed.error}\n`)
+          process.exit(1)
+        }
+        return
+      }
+      // Bridge predates this protocol or sent an event before ack — drop quietly
+      // until ack lands. (Should not happen with the current bridge.)
+      process.stderr.write(`whatsapp channel: ignoring pre-ack frame type=${parsed.type}\n`)
+      return
+    }
+    if (parsed.type === 'message') void handleInbound(parsed as InboundEvent)
+  })
+
   ws.on('close', () => {
     if (shuttingDown) return
     process.stderr.write('whatsapp channel: ws closed, reconnecting in 2s\n')
@@ -776,7 +922,7 @@ function connectWS(): void {
 // ---------------------------------------------------------------------------
 
 try {
-  spawnBridge()
+  await ensureBridge()
 } catch (err) {
   process.stderr.write(`${err}\n`)
   process.exit(1)

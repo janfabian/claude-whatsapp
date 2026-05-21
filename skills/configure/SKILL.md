@@ -7,6 +7,7 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
+  - Bash(curl *)
 ---
 
 # /whatsapp:configure — WhatsApp Channel Setup
@@ -52,6 +53,29 @@ Drive the conversation this way:
 6. **If policy is already `allowlist`** → confirm this is the locked state. To add someone: briefly flip back to pairing, have them DM, pair, flip back.
 
 Never frame `pairing` as the correct long-term choice.
+
+### `sessions` — list MCP sessions attached to the bridge
+
+When multiple Claude sessions share one bridge (via the per-session filter
+feature), each subscribes with its own filter. This subcommand asks the bridge
+who is currently connected.
+
+1. Read `~/.claude/channels/whatsapp/.env` for `WHATSAPP_BRIDGE_PORT` (default
+   `8080`) and `WHATSAPP_BRIDGE_ADDR` (default `127.0.0.1`).
+2. `curl -s http://<addr>:<port>/api/sessions` — returns a JSON array.
+3. Render a table:
+
+```
+SESSION_ID         CLIENT_ID                              CHATS                EXCLUSIVE  CONNECTED
+s1730000000-1      9d1e...-ab12                           [g1@g.us]            true       2026-05-21T12:34:00Z
+s1730000000-2      4f8c...-cd34                           (all)                false      2026-05-21T13:01:00Z
+```
+
+If the array is empty, say *"no MCP sessions currently subscribed."*
+
+If `/api/sessions` returns 404, the bridge is older than the per-session filter
+feature — say *"bridge predates session-filter support; rebuild the bridge
+binary"* and stop.
 
 ### `clear-session` — wipe and start over
 

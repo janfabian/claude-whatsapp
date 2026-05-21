@@ -91,6 +91,72 @@ See **[ACCESS.md](./ACCESS.md)** for DM policies, groups, mention detection, del
 
 Quick reference: JIDs look like `1234567890@s.whatsapp.net` (DMs) or `…@g.us` (groups). Default policy is `pairing`. Access state lives at `~/.claude/channels/whatsapp/access.json`.
 
+## Per-session inbound filter
+
+WhatsApp caps linked companion devices at ~4. To route different Claude
+sessions to different chats *without* burning device slots, each session can
+declare a routing filter at launch via `WHATSAPP_SESSION_FILTER` (JSON).
+One bridge, one pairing, one `access.json` — N sessions, each scoped.
+
+```bash
+WHATSAPP_SESSION_FILTER='{"chats":["120363....@g.us"]}' claude
+```
+
+Shape:
+
+```json
+{
+  "chats": ["120363....@g.us"],     // allowlist of JIDs; empty/missing = all
+  "excludeChats": [],
+  "mentionPatterns": ["^agent\\b"], // optional; overrides access.mentionPatterns
+  "exclusive": false                // opt-in; see below
+}
+```
+
+- **No env var or empty** → match everything. Today's single-session behavior.
+- **`chats`**: only inbound from these JIDs reaches this session.
+- **`excludeChats`**: explicit denylist, evaluated before `chats`.
+- **`mentionPatterns`**: when set, replaces `access.json`'s
+  `mentionPatterns` for *this* session's `requireMention` checks. Absent →
+  global is used.
+- **`exclusive: true`**: opt-in. The bridge claims the listed `chats` for this
+  session; a second session attempting to claim the same chat fails to
+  subscribe and exits non-zero. Claims survive a 30-second reconnect grace
+  window keyed by a stable `client_id` persisted at
+  `~/.claude/channels/whatsapp/session.id`. Requires `chats` to be non-empty.
+
+Default routing when multiple sessions match the same inbound chat is
+**broadcast** — every matching session receives the event. Use `exclusive`
+when exactly one session should handle a chat.
+
+The session filter is **layered below** `access.json`. A chat blocked by
+access never reaches any session, regardless of filter. The filter only
+decides which *allowed* sessions receive a given event.
+
+### Locked-down posture
+
+Combine `WHATSAPP_SESSION_FILTER` with `WHATSAPP_ACCESS_MODE=static` for a
+session whose reachable surface is **fixed at launch and structurally
+unmodifiable** while the process runs:
+
+```bash
+WHATSAPP_ACCESS_MODE=static \
+WHATSAPP_SESSION_FILTER='{"chats":["g1@g.us"],"exclusive":true}' \
+  claude
+```
+
+`static` mode (already supported) freezes the access policy: pairing is
+downgraded to allowlist, pending pairings are wiped, and `access.json`
+mutations from the `/whatsapp:access` skill are refused. Together with the
+session filter, this means a prompt-injected message cannot widen the
+session's reach by editing access or pairing a new sender.
+
+### Inspecting connected sessions
+
+`/whatsapp:configure sessions` queries the bridge's `/api/sessions` endpoint
+and prints a table of subscribed sessions, their filters, and exclusive
+claims. Read-only.
+
 ## Tools exposed to the assistant
 
 | Tool | Purpose |

@@ -67,6 +67,12 @@ WhatsApp doesn't have a native "mention this bot" concept (the assistant is invi
 
 A reply to one of *your own* messages also delivers, regardless of patterns — that's the most natural way to "address the assistant" in a group.
 
+**Per-session override.** A session launched with
+`WHATSAPP_SESSION_FILTER='{"mentionPatterns":["^agent\\b"]}'` ignores the
+global `mentionPatterns` and uses its own for `requireMention` group checks.
+Absent → global is used. See the "Per-session inbound filter" section in the
+README.
+
 ## Delivery
 
 Configure outbound behavior with `/whatsapp:access set <key> <value>`.

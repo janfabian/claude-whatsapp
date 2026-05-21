@@ -14,9 +14,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -58,49 +60,288 @@ func qrFilePath() string {
 func messagesDBPath() string { return filepath.Join(storeDir, "messages.db") }
 func sessionDBPath() string  { return filepath.Join(storeDir, "whatsapp.db") }
 
-// Event broadcaster: every inbound message gets pushed to all connected WS
-// clients. The MCP server is the expected (single) client; the per-client
-// channel buffer gives slow consumers a small grace window before drop.
-type eventHub struct {
-	mu      sync.Mutex
-	clients map[*websocket.Conn]chan []byte
+// Event router: every inbound message gets evaluated against each connected
+// WS client's filter, then sent only to matching clients. MCP servers send a
+// subscribe frame after WS upgrade; until then the client sits in pending
+// state and inbound payloads are buffered (bounded). One bridge fans out to
+// many MCP-connected Claude sessions, each scoped by its launch-time filter.
+//
+// Mention-pattern matching is intentionally NOT done here. server.ts owns
+// mention filtering (it already does, against access.json) — putting it in
+// the bridge too would duplicate the regex semantics in two languages. The
+// bridge does pure chat-routing; mention precedence lives in server.ts.
+
+const (
+	backlogCap = 16
+	claimGrace = 30 * time.Second
+)
+
+// sessionFilter is the per-WS-client routing filter sent in the subscribe frame.
+type sessionFilter struct {
+	Chats        []string `json:"chats"`
+	ExcludeChats []string `json:"excludeChats"`
+	Exclusive    bool     `json:"exclusive"`
 }
 
-func newEventHub() *eventHub { return &eventHub{clients: map[*websocket.Conn]chan []byte{}} }
+// matches returns true if the chat is allowed by this filter. Nil filter
+// matches everything (back-compat: no WHATSAPP_SESSION_FILTER → match all).
+func (f *sessionFilter) matches(chatJID string) bool {
+	if f == nil {
+		return true
+	}
+	for _, c := range f.ExcludeChats {
+		if c == chatJID {
+			return false
+		}
+	}
+	if len(f.Chats) == 0 {
+		return true
+	}
+	for _, c := range f.Chats {
+		if c == chatJID {
+			return true
+		}
+	}
+	return false
+}
 
-func (h *eventHub) add(c *websocket.Conn) chan []byte {
-	ch := make(chan []byte, 64)
+// subscribeFrame is the first frame an MCP server sends after WS upgrade.
+type subscribeFrame struct {
+	Type     string         `json:"type"`
+	ClientID string         `json:"client_id"`
+	Filter   *sessionFilter `json:"filter"`
+}
+
+// subscribeAck is the bridge's reply.
+type subscribeAck struct {
+	Type      string `json:"type"`
+	OK        bool   `json:"ok"`
+	SessionID string `json:"session_id,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type wsClient struct {
+	conn        *websocket.Conn
+	ch          chan []byte
+	pending     bool
+	backlog     [][]byte
+	filter      *sessionFilter
+	sessionID   string
+	clientID    string
+	connectedAt time.Time
+}
+
+// claimRegistry tracks exclusive chat-claims with a reconnect grace window.
+// Disconnect doesn't drop a claim immediately; it sets releasedAt, and the
+// claim survives claimGrace so a brief network blip (laptop sleep, NAT
+// timeout) can't let another session steal the chat.
+type claim struct {
+	clientID   string
+	releasedAt time.Time // zero = active; non-zero = in grace window
+}
+
+type claimRegistry struct {
+	mu     sync.Mutex
+	claims map[string]*claim // chat JID -> claim
+}
+
+func newClaimRegistry() *claimRegistry { return &claimRegistry{claims: map[string]*claim{}} }
+
+func (r *claimRegistry) expireLocked() {
+	cutoff := time.Now().Add(-claimGrace)
+	for jid, c := range r.claims {
+		if !c.releasedAt.IsZero() && c.releasedAt.Before(cutoff) {
+			delete(r.claims, jid)
+		}
+	}
+}
+
+// tryClaim returns nil on success. A grace-window claim by the same clientID
+// is reactivated.
+func (r *claimRegistry) tryClaim(jid, clientID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.expireLocked()
+	if c, ok := r.claims[jid]; ok {
+		if c.clientID == clientID {
+			c.releasedAt = time.Time{}
+			return nil
+		}
+		return fmt.Errorf("chat %s already claimed by another session", jid)
+	}
+	r.claims[jid] = &claim{clientID: clientID}
+	return nil
+}
+
+// releaseChat removes a single chat's claim. Used to roll back partial claims
+// during a failed multi-chat subscribe.
+func (r *claimRegistry) releaseChat(jid, clientID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if c, ok := r.claims[jid]; ok && c.clientID == clientID {
+		delete(r.claims, jid)
+	}
+}
+
+// release marks all of clientID's claims as in-grace.
+func (r *claimRegistry) release(clientID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	for _, c := range r.claims {
+		if c.clientID == clientID && c.releasedAt.IsZero() {
+			c.releasedAt = now
+		}
+	}
+}
+
+type eventHub struct {
+	mu      sync.Mutex
+	clients map[*websocket.Conn]*wsClient
+	claims  *claimRegistry
+}
+
+func newEventHub() *eventHub {
+	return &eventHub{
+		clients: map[*websocket.Conn]*wsClient{},
+		claims:  newClaimRegistry(),
+	}
+}
+
+func (h *eventHub) add(c *websocket.Conn) *wsClient {
+	cl := &wsClient{
+		conn:        c,
+		ch:          make(chan []byte, 64),
+		pending:     true,
+		connectedAt: time.Now(),
+	}
 	h.mu.Lock()
-	h.clients[c] = ch
+	h.clients[c] = cl
 	h.mu.Unlock()
-	return ch
+	return cl
+}
+
+// activate flips a client out of pending state and drains its backlog
+// through the filter. Called after a successful subscribe handshake.
+func (h *eventHub) activate(c *websocket.Conn, filter *sessionFilter, sessionID, clientID string) {
+	h.mu.Lock()
+	cl, ok := h.clients[c]
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	cl.filter = filter
+	cl.sessionID = sessionID
+	cl.clientID = clientID
+	cl.pending = false
+	backlog := cl.backlog
+	cl.backlog = nil
+	ch := cl.ch
+	h.mu.Unlock()
+
+	for _, p := range backlog {
+		var evt InboundEvent
+		if err := json.Unmarshal(p, &evt); err != nil {
+			continue
+		}
+		if !filter.matches(evt.ChatJID) {
+			continue
+		}
+		select {
+		case ch <- p:
+		default:
+		}
+	}
 }
 
 func (h *eventHub) remove(c *websocket.Conn) {
 	h.mu.Lock()
-	if ch, ok := h.clients[c]; ok {
-		close(ch)
+	cl, ok := h.clients[c]
+	if ok {
+		close(cl.ch)
 		delete(h.clients, c)
 	}
 	h.mu.Unlock()
+	if ok && cl.clientID != "" {
+		h.claims.release(cl.clientID)
+	}
 }
 
-func (h *eventHub) broadcast(payload []byte) {
+// dispatch routes a single event to matching clients. Pending clients get
+// buffered (bounded). Snapshot under lock; send outside.
+func (h *eventHub) dispatch(evt InboundEvent, payload []byte) {
+	type target struct {
+		conn  *websocket.Conn
+		ch    chan []byte
+		match bool
+	}
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	for c, ch := range h.clients {
+	targets := make([]target, 0, len(h.clients))
+	for c, cl := range h.clients {
+		if cl.pending {
+			if len(cl.backlog) < backlogCap {
+				cl.backlog = append(cl.backlog, payload)
+			}
+			continue
+		}
+		targets = append(targets, target{
+			conn:  c,
+			ch:    cl.ch,
+			match: cl.filter.matches(evt.ChatJID),
+		})
+	}
+	h.mu.Unlock()
+
+	var dropConns []*websocket.Conn
+	for _, t := range targets {
+		if !t.match {
+			continue
+		}
 		select {
-		case ch <- payload:
+		case t.ch <- payload:
 		default:
-			// Slow consumer — drop so we don't backlog forever.
-			close(ch)
-			delete(h.clients, c)
-			_ = c.Close()
+			dropConns = append(dropConns, t.conn)
+		}
+	}
+	if len(dropConns) > 0 {
+		h.mu.Lock()
+		var releaseIDs []string
+		for _, c := range dropConns {
+			if cl, ok := h.clients[c]; ok {
+				close(cl.ch)
+				delete(h.clients, c)
+				_ = c.Close()
+				if cl.clientID != "" {
+					releaseIDs = append(releaseIDs, cl.clientID)
+				}
+			}
+		}
+		h.mu.Unlock()
+		for _, id := range releaseIDs {
+			h.claims.release(id)
 		}
 	}
 }
 
 var hub = newEventHub()
+
+// jidRE matches the JID forms whatsmeow emits: user, group, broadcast,
+// newsletter, lid.
+var jidRE = regexp.MustCompile(`^[0-9A-Za-z._-]+@(s\.whatsapp\.net|g\.us|broadcast|newsletter|lid)$`)
+
+func isValidJID(s string) bool { return jidRE.MatchString(s) }
+
+var sessionCounter atomic.Uint64
+
+func newSessionID() string {
+	n := sessionCounter.Add(1)
+	return fmt.Sprintf("s%d-%d", time.Now().Unix(), n)
+}
+
+func writeAck(conn *websocket.Conn, ack subscribeAck) error {
+	b, _ := json.Marshal(ack)
+	return conn.WriteMessage(websocket.TextMessage, b)
+}
 
 // InboundEvent is the JSON payload broadcast over /ws/events whenever a
 // message arrives. server.ts maps these to notifications/claude/channel.
@@ -590,7 +831,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		QuotedMessageID: extractQuotedID(msg.Message),
 	}
 	if payload, err := json.Marshal(evt); err == nil {
-		hub.broadcast(payload)
+		hub.dispatch(evt, payload)
 	}
 }
 
@@ -1034,16 +1275,90 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// WebSocket: clients subscribe to /ws/events for real-time inbound messages.
+	// Protocol: after upgrade the client MUST send a subscribe frame within 5s.
+	// The bridge replies with subscribe_ack. Inbound messages received in that
+	// window are buffered (bounded) and drained through the filter on ack.
 	http.HandleFunc("/ws/events", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := wsUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			fmt.Printf("ws upgrade failed: %v\n", err)
 			return
 		}
-		ch := hub.add(conn)
+		cl := hub.add(conn)
 		defer hub.remove(conn)
-		// Reader: discard incoming frames; we treat the channel as one-way push.
-		// This loop exits when the client disconnects, which lets the writer below return.
+
+		// Read subscribe frame with deadline.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		_, frame, err := conn.ReadMessage()
+		_ = conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "no subscribe frame: " + err.Error()})
+			_ = conn.Close()
+			return
+		}
+
+		var sub subscribeFrame
+		if err := json.Unmarshal(frame, &sub); err != nil {
+			_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "malformed subscribe: " + err.Error()})
+			_ = conn.Close()
+			return
+		}
+		if sub.Type != "subscribe" {
+			_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "first frame must be type=subscribe"})
+			_ = conn.Close()
+			return
+		}
+		if sub.ClientID == "" {
+			_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "client_id required"})
+			_ = conn.Close()
+			return
+		}
+		if sub.Filter != nil {
+			for _, j := range sub.Filter.Chats {
+				if !isValidJID(j) {
+					_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "invalid JID in chats: " + j})
+					_ = conn.Close()
+					return
+				}
+			}
+			for _, j := range sub.Filter.ExcludeChats {
+				if !isValidJID(j) {
+					_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "invalid JID in excludeChats: " + j})
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+
+		// Exclusive claims: roll back on any conflict.
+		if sub.Filter != nil && sub.Filter.Exclusive {
+			if len(sub.Filter.Chats) == 0 {
+				_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: "exclusive=true requires a chats allowlist"})
+				_ = conn.Close()
+				return
+			}
+			var claimed []string
+			for _, j := range sub.Filter.Chats {
+				if err := hub.claims.tryClaim(j, sub.ClientID); err != nil {
+					for _, c := range claimed {
+						hub.claims.releaseChat(c, sub.ClientID)
+					}
+					_ = writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: false, Error: err.Error()})
+					_ = conn.Close()
+					return
+				}
+				claimed = append(claimed, j)
+			}
+		}
+
+		sessionID := newSessionID()
+		hub.activate(conn, sub.Filter, sessionID, sub.ClientID)
+		if err := writeAck(conn, subscribeAck{Type: "subscribe_ack", OK: true, SessionID: sessionID}); err != nil {
+			_ = conn.Close()
+			return
+		}
+
+		// Reader: discard subsequent frames. Exit unblocks the writer.
 		go func() {
 			for {
 				if _, _, err := conn.NextReader(); err != nil {
@@ -1052,11 +1367,40 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 				}
 			}
 		}()
-		for payload := range ch {
+		for payload := range cl.ch {
 			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
 				return
 			}
 		}
+	})
+
+	// Read-only view of connected sessions, for the /whatsapp:configure skill.
+	http.HandleFunc("/api/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		type sessionView struct {
+			SessionID   string         `json:"session_id"`
+			ClientID    string         `json:"client_id"`
+			Filter      *sessionFilter `json:"filter"`
+			Pending     bool           `json:"pending"`
+			ConnectedAt string         `json:"connected_at"`
+		}
+		hub.mu.Lock()
+		out := make([]sessionView, 0, len(hub.clients))
+		for _, cl := range hub.clients {
+			out = append(out, sessionView{
+				SessionID:   cl.sessionID,
+				ClientID:    cl.clientID,
+				Filter:      cl.filter,
+				Pending:     cl.pending,
+				ConnectedAt: cl.connectedAt.UTC().Format(time.RFC3339),
+			})
+		}
+		hub.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 	})
 
 	// Start the server
