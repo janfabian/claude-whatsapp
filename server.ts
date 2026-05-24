@@ -175,7 +175,10 @@ function takeOverPidFile(file: string): void {
     }
   } catch {}
 }
-takeOverPidFile(MCP_PID_FILE)
+// MCP servers are intentionally non-singleton: each Claude session spawns
+// its own. Don't take over the PID file — that would SIGTERM a sibling
+// session's MCP server. We still write our own PID for shutdown cleanup
+// bookkeeping; last writer wins, which is fine (only it can clean up).
 writeFileSync(MCP_PID_FILE, String(process.pid))
 
 process.on('unhandledRejection', err => {
