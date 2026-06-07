@@ -4,3 +4,4 @@ bun.lock.local
 bridge/bin/
 *.log
 .DS_Store
+bridge/whatsapp-bridge
