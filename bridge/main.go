@@ -509,14 +509,36 @@ func extractTextContent(msg *waProto.Message) string {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text.
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		if t := extendedText.GetText(); t != "" {
+			return t
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Media captions. Without this the mention check in server.ts gate()
+	// has nothing to match against on a captioned photo/video/document, so
+	// requireMention groups silently drop captioned media.
+	if img := msg.GetImageMessage(); img != nil {
+		if c := img.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if vid := msg.GetVideoMessage(); vid != nil {
+		if c := vid.GetCaption(); c != "" {
+			return c
+		}
+	}
+	if doc := msg.GetDocumentMessage(); doc != nil {
+		if c := doc.GetCaption(); c != "" {
+			return c
+		}
+	}
+	// AudioMessage has no caption field in WhatsApp's protocol.
+
 	return ""
 }
 
