@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Builds the WhatsApp bridge binary into bridge/bin/<os>-<arch>/whatsapp-bridge.
-# Idempotent — skips the build if the binary is newer than every .go file.
+# Idempotent via Go's own build cache — `go build` is a no-op when nothing
+# changed and fast even when something did. We do NOT pre-skip based on
+# mtime, because the plugin installer can copy a binary forward across
+# versions without touching source mtimes, leaving a stale binary that
+# looks "newer than source" and dodges recompile. (Real bug: 0.0.5→0.0.6
+# debug-log code never made it into the deployed binary.)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,16 +21,8 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
-# Skip if up to date — every .go file older than the binary.
-if [[ -x "$OUT" ]]; then
-  newest_src=$(find "$SRC" -name '*.go' -newer "$OUT" -print -quit 2>/dev/null || true)
-  if [[ -z "$newest_src" ]]; then
-    exit 0
-  fi
-fi
-
 mkdir -p "$OUT_DIR"
-echo "build-bridge: compiling $OUT" >&2
+echo "build-bridge: building $OUT" >&2
 cd "$SRC"
 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o "$OUT" .
 echo "build-bridge: done" >&2
