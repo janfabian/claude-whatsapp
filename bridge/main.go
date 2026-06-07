@@ -33,6 +33,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -794,6 +795,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+
+	// Debug: when we have media but no extracted text, dump the raw protobuf
+	// so we can see where the caption actually lives. This is the smoking-gun
+	// log for the "captioned media doesn't trigger requireMention groups" bug.
+	if mediaType != "" && content == "" && msg.Message != nil {
+		opts := protojson.MarshalOptions{Multiline: false}
+		if b, err := opts.Marshal(msg.Message); err == nil {
+			fmt.Printf("[debug] media-no-content proto: %s\n", b)
+		}
+	}
 
 	// Skip if there's no content and no media
 	if content == "" && mediaType == "" {
