@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -115,5 +116,48 @@ func TestIsValidJID(t *testing.T) {
 		if isValidJID(s) {
 			t.Errorf("expected %q invalid", s)
 		}
+	}
+}
+
+func TestUniqueMediaSuffix(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"short hex kept whole", "ABC123", "ABC123"},
+		{"long id truncated to last 12", "3ABAAAC8F08C54C89020", "F08C54C89020"},
+		{"non-alnum stripped", "AC:9F-35/16", "AC9F3516"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := uniqueMediaSuffix(c.id); got != c.want {
+				t.Fatalf("uniqueMediaSuffix(%q) = %q, want %q", c.id, got, c.want)
+			}
+		})
+	}
+}
+
+// TestMediaFilenameUniquePerMessage is the regression guard for the bug where
+// several images sent in the same second shared one filename and overwrote each
+// other. Same timestamp + different message IDs must yield different filenames.
+func TestMediaFilenameUniquePerMessage(t *testing.T) {
+	a := mediaFilename("image", "jpg", "3A1E2B15BC322130C53A")
+	b := mediaFilename("image", "jpg", "3AE910DC39D4AB097CBE")
+	if a == b {
+		t.Fatalf("same-second images collided: both named %q", a)
+	}
+	for _, name := range []string{a, b} {
+		if !strings.HasPrefix(name, "image_") || !strings.HasSuffix(name, ".jpg") {
+			t.Fatalf("unexpected filename shape: %q", name)
+		}
+	}
+	// No message ID → legacy timestamp-only name; the suffixed variant adds
+	// exactly one extra "_<suffix>" segment before the extension.
+	legacy := mediaFilename("video", "mp4", "")
+	withID := mediaFilename("video", "mp4", "3AE910DC39D4AB097CBE")
+	if strings.Count(withID, "_") != strings.Count(legacy, "_")+1 {
+		t.Fatalf("suffixed name %q should have one more underscore than legacy %q", withID, legacy)
 	}
 }
