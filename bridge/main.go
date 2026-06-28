@@ -725,27 +725,61 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
-// Extract media info from a message
-func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
+// uniqueMediaSuffix derives a short, filesystem-safe token from a WhatsApp
+// message ID. It keeps generated media filenames unique even when several
+// arrive within the same second (the timestamp prefix alone is only
+// second-resolution, so same-second images would otherwise share a name,
+// overwrite each other on disk, and all resolve to one file on download).
+// Returns "" when no message ID is available, in which case callers fall back
+// to the legacy timestamp-only name.
+func uniqueMediaSuffix(messageID string) string {
+	var b strings.Builder
+	for _, r := range messageID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	// The last 12 chars of a WhatsApp message ID are ample to disambiguate
+	// messages within a chat while keeping filenames short and readable.
+	if len(s) > 12 {
+		s = s[len(s)-12:]
+	}
+	return s
+}
+
+// mediaFilename builds "<prefix>_<timestamp>_<suffix>.<ext>", or the legacy
+// "<prefix>_<timestamp>.<ext>" when the message ID is empty.
+func mediaFilename(prefix, ext, messageID string) string {
+	ts := time.Now().Format("20060102_150405")
+	if suffix := uniqueMediaSuffix(messageID); suffix != "" {
+		return fmt.Sprintf("%s_%s_%s.%s", prefix, ts, suffix, ext)
+	}
+	return fmt.Sprintf("%s_%s.%s", prefix, ts, ext)
+}
+
+// extractMediaInfo extracts media info from a message. messageID makes the
+// generated filename unique per message (see uniqueMediaSuffix).
+func extractMediaInfo(msg *waProto.Message, messageID string) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
 	}
 
 	// Check for image message
 	if img := msg.GetImageMessage(); img != nil {
-		return "image", "image_" + time.Now().Format("20060102_150405") + ".jpg",
+		return "image", mediaFilename("image", "jpg", messageID),
 			img.GetURL(), img.GetMediaKey(), img.GetFileSHA256(), img.GetFileEncSHA256(), img.GetFileLength()
 	}
 
 	// Check for video message
 	if vid := msg.GetVideoMessage(); vid != nil {
-		return "video", "video_" + time.Now().Format("20060102_150405") + ".mp4",
+		return "video", mediaFilename("video", "mp4", messageID),
 			vid.GetURL(), vid.GetMediaKey(), vid.GetFileSHA256(), vid.GetFileEncSHA256(), vid.GetFileLength()
 	}
 
 	// Check for audio message
 	if aud := msg.GetAudioMessage(); aud != nil {
-		return "audio", "audio_" + time.Now().Format("20060102_150405") + ".ogg",
+		return "audio", mediaFilename("audio", "ogg", messageID),
 			aud.GetURL(), aud.GetMediaKey(), aud.GetFileSHA256(), aud.GetFileEncSHA256(), aud.GetFileLength()
 	}
 
@@ -754,6 +788,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 		filename := doc.GetFileName()
 		if filename == "" {
 			filename = "document_" + time.Now().Format("20060102_150405")
+		}
+		// Prepend the unique suffix so two documents sharing a name (or arriving
+		// in the same second with the fallback name) don't collide on disk.
+		if suffix := uniqueMediaSuffix(messageID); suffix != "" {
+			filename = suffix + "-" + filename
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
@@ -793,8 +832,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
-	// Extract media info
-	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
+	// Extract media info. The message ID keeps media filenames unique so that
+	// several images sent in the same second don't overwrite each other.
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message, msg.Info.ID)
 
 	// Debug: when we have media but no extracted text, dump the raw protobuf
 	// so we can see where the caption actually lives. This is the smoking-gun
@@ -1746,13 +1786,20 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Message ID — needed up front so media filenames are unique
+				// (see extractMediaInfo) even for same-second history messages.
+				msgID := ""
+				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
+					msgID = *msg.Message.Key.ID
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
 				var fileLength uint64
 
 				if msg.Message.Message != nil {
-					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
+					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message, msgID)
 				}
 
 				// Log the message content for debugging
@@ -1779,12 +1826,6 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				} else {
 					sender = jid.User
-				}
-
-				// Store message
-				msgID := ""
-				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
-					msgID = *msg.Message.Key.ID
 				}
 
 				// Get message timestamp
