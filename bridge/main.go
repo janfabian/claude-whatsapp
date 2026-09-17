@@ -1502,22 +1502,6 @@ func main() {
 	store.SetOSInfo(osName, [3]uint32{2, 0, 0})
 	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_DESKTOP.Enum()
 
-	// Emergency lever for "405 client outdated". The WhatsApp web client version
-	// is a constant inside whatsmeow, and once WhatsApp retires it the bridge
-	// cannot connect at all until the library is bumped. Setting
-	// WHATSAPP_WA_VERSION=2.3000.1047451014 overrides it without waiting for a
-	// release. Upstream's own caveat applies: if the protocol changed too, a
-	// version bump alone will not be enough — this buys time, it is not a fix.
-	if raw := os.Getenv("WHATSAPP_WA_VERSION"); raw != "" {
-		if version, err := store.ParseVersion(raw); err != nil {
-			logger.Errorf("Ignoring invalid WHATSAPP_WA_VERSION %q: %v", raw, err)
-		} else {
-			previous := store.GetWAVersion()
-			store.SetWAVersion(version)
-			logger.Infof("WhatsApp web client version overridden: %s -> %s", previous, version)
-		}
-	}
-
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
