@@ -1106,10 +1106,10 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string. whatsmeow builds the download URL as
+	// host + directPath + "&hash=...&mms-type=...", so the direct path has to
+	// carry its own "?ccb=...&oh=...&oe=..."; stripping it produces a URL with
+	// "&" and no "?", which WhatsApp answers with 403 on every download.
 	return "/" + pathPart
 }
 
