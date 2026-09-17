@@ -1,0 +1,75 @@
+name: Bump whatsmeow
+
+# WhatsApp rejects outdated client versions with "405 client outdated", and the
+# version is a constant inside whatsmeow — so a stale pin in bridge/go.mod takes
+# the bridge offline with no warning and no way to recover except a bump.
+# This keeps the pin moving and surfaces breaking API changes as a red PR
+# instead of a dead bridge.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # every Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bridge/go.mod
+          cache-dependency-path: bridge/go.sum
+
+      - name: Update whatsmeow
+        id: update
+        working-directory: bridge
+        run: |
+          go get go.mau.fi/whatsmeow@latest
+          go mod tidy
+          if git diff --quiet -- go.mod go.sum; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "whatsmeow already up to date"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "version=$(go list -m -f '{{.Version}}' go.mau.fi/whatsmeow)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify it still builds
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          cd bridge && go vet ./... && go test ./...
+          cd .. && bash scripts/build-bridge.sh
+
+      - name: Open pull request
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.update.outputs.version }}
+        run: |
+          BRANCH="deps/whatsmeow-${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -am "deps: bump whatsmeow to ${VERSION}"
+          git push -u origin "$BRANCH"
+          cat > /tmp/pr-body.md <<'EOF'
+          Weekly whatsmeow bump, opened automatically.
+
+          The WhatsApp web client version lives as a constant inside whatsmeow, and
+          WhatsApp eventually rejects old ones with `405 client outdated` — which takes
+          the bridge offline until the pin moves. This keeps it moving.
+
+          `go vet`, `go test` and `scripts/build-bridge.sh` passed before this PR was
+          opened. If it is red, whatsmeow changed something that needs code changes too.
+
+          Bump the plugin version in `package.json` and `.claude-plugin/plugin.json`
+          when merging if you want existing installs to pick it up.
+          EOF
+          gh pr create --base main --head "$BRANCH" \
+            --title "deps: bump whatsmeow to ${VERSION}" \
+            --body-file /tmp/pr-body.md
