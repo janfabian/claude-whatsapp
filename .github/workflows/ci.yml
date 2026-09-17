@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: bridge/go.mod
+          cache-dependency-path: bridge/go.sum
+
+      - name: Vet
+        working-directory: bridge
+        run: go vet ./...
+
+      - name: Test
+        working-directory: bridge
+        run: go test ./...
+
+      - name: Build (same script the plugin runs on start)
+        run: bash scripts/build-bridge.sh
+
+      - name: Report pinned whatsmeow version
+        working-directory: bridge
+        run: go list -m go.mau.fi/whatsmeow
